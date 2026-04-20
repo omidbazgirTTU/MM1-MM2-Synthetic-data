@@ -1,0 +1,91 @@
+# ── Confidential / legal documents ────────────────────────────────────────────
+# Vivli data access application and signed agreements — never commit
+Vivli-data-request-NCT01850524.pdf
+Vivli-document-sign.pdf
+
+# Reference PDFs (large binaries; not needed in repo)
+*.pdf
+
+# ── Claude / AI agent internals ───────────────────────────────────────────────
+# Contains system prompts, project instructions, and conversation memory
+CLAUDE.md
+.claude/projects/
+.claude/todos/
+# Keep skills — they are reusable project knowledge worth versioning
+# .claude/skills/
+
+# ── Python environment ─────────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+pip-log.txt
+pip-delete-this-directory.txt
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Jupyter ────────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── macOS system files ─────────────────────────────────────────────────────────
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# ── IDE / editor ──────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# ── Secrets and credentials ───────────────────────────────────────────────────
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+secrets.yml
+secrets.yaml
+credentials.json
+config/local_settings.py
+
+# ── Generated data — CSV files and study folders ──────────────────────────────
+# All CSV files are reproducible by running scripts/generate_v2.py and
+# scripts/generate_pk_v2.py. Do not commit large data files to the repo.
+*.csv
+*.xlsx
+MM1/
+MM2/
+
+# ── Large outputs — figures and generated artefacts ───────────────────────────
+# Individual patient figures (1,400+ PNGs) are reproducible from scripts
+outputs/figures/MM1/
+outputs/figures/MM2/
+
+# Keep top-level VPC/GOF figures and the validation report
+# outputs/figures/pk_vpc_*.png  → tracked
+# outputs/figures/pk_gof_*.png  → tracked
+# outputs/VALIDATION_REPORT.md  → tracked
+
+# ── Miscellaneous ─────────────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*.orig
+.cache/
+tmp/
+temp/
