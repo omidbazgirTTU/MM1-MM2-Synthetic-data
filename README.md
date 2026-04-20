@@ -192,21 +192,4 @@ boundary noise misclassification.
 
 ## Citation
 
-If using this synthetic dataset, please cite the original paper:
-
-```
-Hussain Z, De Brouwer E, et al. (2024). Joint AI-driven event prediction and
-longitudinal modeling in newly diagnosed and relapsed multiple myeloma.
-npj Digital Medicine, 7, 200. https://doi.org/10.1038/s41746-024-01189-3
-```
-
-PK model parameters from:
-
-```
-Gupta N, et al. (2017). Population pharmacokinetics of ixazomib, an oral proteasome
-inhibitor, in patients with relapsed/refractory multiple myeloma.
-Clinical Pharmacokinetics. doi:10.1007/s40262-016-0479-y
-
-Chen N, et al. (2012). Population pharmacokinetics of lenalidomide in patients with
-multiple myeloma. Journal of Clinical Pharmacology, 52(12), 1871–1882.
-```
+If using this synthetic dataset, please reach out to omidbazgir00@gmail.com or ranadip.pal@ttu.edu
