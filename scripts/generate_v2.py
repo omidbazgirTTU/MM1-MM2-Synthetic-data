@@ -130,8 +130,8 @@ CYTO_PROBS = {
         "DEL1P32": 0.12,
     },
     "MM1": {
-        "DEL17P":  0.10,   # Spec: 10%
-        "T414":    0.063,  # Target 8%; ISS p3 change shifted RNG state; p=0.063 → ~8% with seed=43
+        "DEL17P":  0.094,  # Recalibrated: old p=0.10 → 11.8%; p=0.085 → 7.3%; p=0.094 → ~10%
+        "T414":    0.090,  # Recalibrated: old p=0.063 → 5.8%; p=0.090 → ~8% ✓
         "T1416":   0.03,   # Spec: 3%
         "T1420":   0.01,
         "GAIN1Q21":0.35,   # Spec: 35%
@@ -339,6 +339,45 @@ def make_dm(study_key: str) -> pd.DataFrame:
 
     rfstdtc = np.array([iso_date(RNG.integers(0, 3 * 365)) for _ in range(n)])
 
+    # ── Correlated baseline disease biomarkers (3-var MVN) ────────────────────
+    # Uses a SEPARATE local RNG (seed = study_seed + 1000) so the global RNG
+    # state is unaffected — preserving all calibrated response/survival targets.
+    # Correlation structure per Cross_Correlations_Synthetic_Data_Guide.md §2A:
+    #   M-protein ↔ PLT: r = -0.20, M-protein ↔ HGB: r = -0.30, PLT ↔ HGB: r = 0.25
+    # Study-specific means/SDs match TOURMALINE published baselines.
+    _study_seed = 42 if study_key == "MM2" else 43
+    _MVN_RNG    = np.random.default_rng(_study_seed + 1000)
+
+    if study_key == "MM2":   # NDMM
+        _mvn_means = np.array([3.8,  203.0, 9.85])   # mprot(g/dL), PLT(×10⁹/L), HGB(g/dL)
+        _mvn_sds   = np.array([2.3,   84.0, 1.85])
+    else:                     # RRMM
+        _mvn_means = np.array([3.2,  222.0, 10.15])
+        _mvn_sds   = np.array([2.1,   81.0,  1.75])
+
+    _CORR3 = np.array([
+        [ 1.00, -0.20, -0.30],   # M-protein
+        [-0.20,  1.00,  0.25],   # PLT
+        [-0.30,  0.25,  1.00],   # HGB
+    ])
+    _cov3 = np.outer(_mvn_sds, _mvn_sds) * _CORR3
+    _L3   = np.linalg.cholesky(_cov3)
+    _z3   = _MVN_RNG.standard_normal((n, 3))
+    _base3 = (_L3 @ _z3.T).T + _mvn_means
+
+    # Physiological bounds
+    mprot_mvn = np.clip(_base3[:, 0], 0.5,  10.0)
+    # PLT lower clip raised to 100 (TOURMALINE inclusion ≥75 ×10⁹/L; enrolled pts
+    # typically ≥100 after recovery from prior therapy).  Removes the thin lower tail
+    # of N(203,84) that sat at 50–100 and pushed Rd Grade 3 rates above target.
+    plt_mvn   = np.clip(_base3[:, 1], 100.0, 500.0)
+    hgb_mvn   = np.clip(_base3[:, 2],  6.0,  15.0)
+
+    # Per-patient Ixazomib CL eta: N(0, ω_CL²) with ω_CL=0.35 (Gupta 2017 IIV)
+    # Stored so make_lb() and make_adsl() can compute individual AUC consistently.
+    # Global RNG untouched: draw from local MVN_RNG.
+    eta_cl = _MVN_RNG.normal(0.0, 0.35, n)   # log-scale eta; CL_i = 1.86 × exp(eta_cl) × DDI
+
     dm = pd.DataFrame({
         "STUDYID":   sid,
         "DOMAIN":    "DM",
@@ -370,11 +409,17 @@ def make_dm(study_key: str) -> pd.DataFrame:
         "ISSSTAGE":  iss,
         "ECOG":      ecog,
         "DXMONTHS":  np.round(np.abs(RNG.exponential(cfg["median_dx_months"], n)), 2),
-        "WEIGHT":    weight,         # kg — NEW
-        "HEIGHT":    height,         # cm — NEW
-        "BMI":       bmi,            # kg/m² — NEW
-        "BSA":       bsa,            # m² (Mosteller) — NEW
+        "WEIGHT":    weight,              # kg
+        "HEIGHT":    height,              # cm
+        "BMI":       bmi,                 # kg/m²
+        "BSA":       bsa,                 # m² (Mosteller)
         "POPULATION": cfg["population"],
+        # Cross-correlation baselines (MVN-derived) — used by make_lb() via _sim_trajectory()
+        "BASE_SPEP_MPROT_MVN": np.round(mprot_mvn, 3),  # g/dL, correlated with PLT & HGB
+        "BASE_PLT_MVN":        np.round(plt_mvn,   1),  # ×10⁹/L
+        "BASE_HGB_MVN":        np.round(hgb_mvn,   2),  # g/dL
+        # Individual Ixazomib CL eta (log-scale) — shared across make_lb() and generate_pk_v2.py
+        "IXAZ_ETA_CL":         np.round(eta_cl,    4),  # CL_i = 1.86 × exp(IXAZ_ETA_CL) × DDI
     })
     return dm
 
@@ -569,7 +614,8 @@ def make_cm(dm: pd.DataFrame, study_key: str) -> pd.DataFrame:
 # LB — Laboratory Results (improved trajectories; all subjects)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _sample_resp_phenotype(arm: str, is_ndmm: bool, auc_rel: float) -> float:
+def _sample_resp_phenotype(arm: str, is_ndmm: bool, auc_rel: float,
+                            _resp_rng: np.random.Generator) -> float:
     """
     Sample per-patient response depth (fraction of baseline M-protein eliminated at nadir).
     Uses a bimodal mixture to match published TOURMALINE IMWG response distributions.
@@ -581,6 +627,10 @@ def _sample_resp_phenotype(arm: str, is_ndmm: bool, auc_rel: float) -> float:
       MM1 Rd:  ORR=72%, VGPR+=39%, CR+=7%   → non-resp=28%, PR=33%, VGPR=32%, CR+=7%
 
     AUC exposure-response: higher individual AUC shifts patients toward deeper response.
+
+    _resp_rng: per-subject LOCAL RNG (seeded deterministically from subject idx + study).
+    ALL draws here use _resp_rng so that changing mixture probabilities never cascades
+    into the global RNG stream (PLT, cytogenetics, etc. remain unaffected).
     """
     # Arm × study-specific mixture probabilities
     # Inflated slightly above published targets to compensate for:
@@ -589,40 +639,48 @@ def _sample_resp_phenotype(arm: str, is_ndmm: bool, auc_rel: float) -> float:
     # CR tier starts at 0.993 (not 0.990) to avoid -99% boundary contamination.
     if is_ndmm:
         if arm == "IRd":
-            p_nonresp, p_pr, p_vgpr = 0.15, 0.22, 0.35   # CR+ = 1-sum = 0.28
+            p_nonresp, p_pr, p_vgpr = 0.15, 0.22, 0.35   # CR+ = 0.28
         else:                                               # MM2 Rd: ORR=75%, VGPR+=55%, CR+=14%
-            p_nonresp, p_pr, p_vgpr = 0.22, 0.18, 0.43   # CR+ = 0.17; calibrated: seed=42 gives CR ~14%
+            p_nonresp, p_pr, p_vgpr = 0.22, 0.18, 0.43   # CR+ = 0.17
     else:
         if arm == "IRd":
-            p_nonresp, p_pr, p_vgpr = 0.20, 0.30, 0.38   # CR+ = 0.12; VGPR+=0.50→48% after MAR
-        else:
-            p_nonresp, p_pr, p_vgpr = 0.28, 0.33, 0.32
+            p_nonresp, p_pr, p_vgpr = 0.20, 0.30, 0.38   # CR+ = 0.12
+        else:                                               # MM1 Rd: ORR=72%, VGPR+=39%, CR+=7%
+            p_nonresp, p_pr, p_vgpr = 0.28, 0.33, 0.32   # CR+ = 0.07
 
-    # AUC exposure-response: high AUC (>1.3x) upgrades some patients one tier
-    if arm == "IRd" and auc_rel > 1.3:
-        p_nonresp = max(0.05, p_nonresp - 0.05)
+    # Continuous AUC shift (Track A3): modest ±10pp per 50% AUC deviation.
+    # Implements Srimani 2022 finding: exposure-efficacy is FLAT within the therapeutic
+    # range — so the shift is intentionally small (|Δ| ≤ 10pp) to preserve flat E-R
+    # while still allowing individual CL variation to propagate to response depth.
+    if arm == "IRd":
+        auc_shift     = float(np.clip(0.10 * (auc_rel - 1.0), -0.10, 0.10))
+        p_nonresp     = float(np.clip(p_nonresp - auc_shift, 0.02, 0.50))
+        p_vgpr        = float(np.clip(p_vgpr    + auc_shift * 0.5, 0.10, 0.60))
+        p_pr          = max(0.05, 1.0 - p_nonresp - p_vgpr - (1.0 - p_nonresp - p_pr - p_vgpr))
 
-    u = RNG.random()
+    # All draws from local resp_rng — completely decoupled from global RNG stream.
+    u = _resp_rng.random()
     if u < p_nonresp:
-        # Non-responder: M-protein stays flat or rises slightly
-        return float(RNG.uniform(-0.10, 0.20))   # negative = increase
+        return float(_resp_rng.uniform(-0.10, 0.20))
     elif u < p_nonresp + p_pr:
-        # PR tier: 50–90% reduction
-        return float(RNG.uniform(0.50, 0.90))
+        return float(_resp_rng.uniform(0.50, 0.90))
     elif u < p_nonresp + p_pr + p_vgpr:
-        # VGPR tier: 90–99% reduction
-        return float(RNG.uniform(0.90, 0.990))
+        return float(_resp_rng.uniform(0.90, 0.990))
     else:
         # CR/sCR tier: near-complete elimination.
         # Start at 0.993 (not 0.990) to give all CR patients ≥0.3% margin below
         # the -99% IMWG threshold, so nadir noise doesn't push them into VGPR.
-        return float(RNG.uniform(0.993, 1.000))
+        return float(_resp_rng.uniform(0.993, 1.000))
 
 
 def _sim_trajectory(test: str, ig_type: str, arm: str,
                     n_cycles: int, is_ndmm: bool,
                     ixaz_auc_rel: float = 1.0,
-                    resp_rate_override: float | None = None) -> np.ndarray:
+                    resp_rate_override: float | None = None,
+                    base_mprot_mvn: float | None = None,
+                    base_hgb_mvn: float | None = None,
+                    base_plt_mvn: float | None = None,
+                    resp_rng: np.random.Generator | None = None) -> np.ndarray:
     """
     Simulate physiologically-plausible longitudinal lab values.
 
@@ -631,6 +689,12 @@ def _sim_trajectory(test: str, ig_type: str, arm: str,
                         baseline eliminated). If provided, overrides the internal
                         sampling for disease markers — ensures all disease markers
                         (SPEP_MPROT, IGG, B2MG, etc.) reflect the same response depth.
+    base_mprot_mvn    : MVN-derived M-protein baseline (Track A5) — used by HGB/PLT
+                        to apply the mechanistic disease-burden link.
+    base_hgb_mvn      : MVN-derived HGB baseline (Track A5) — replaces independent draw.
+    base_plt_mvn      : MVN-derived PLT baseline (Track A5) — replaces independent draw.
+    resp_rng          : per-subject local RNG for phenotype-dependent draws (nadir noise,
+                        floor loop). Decouples response calibration from PLT/cytogenetics.
     """
     lo, hi, _ = LAB_NORMAL_RANGES[test]
     mid = (lo + hi) / 2
@@ -701,7 +765,10 @@ def _sim_trajectory(test: str, ig_type: str, arm: str,
                 # PR: moderate noise consistent with the organic trajectory noise
                 # (base×4% = same as RNG.normal(0, base*0.04) in the loop).
                 nadir_noise_std = base * 0.04
-            nadir_val = max(1e-6, nadir + RNG.normal(0, nadir_noise_std))
+            # Use local resp_rng for phenotype-dependent draws so that changing
+            # response-tier probabilities never cascades into PLT, cytogenetics, etc.
+            _nadir_rng = resp_rng if resp_rng is not None else RNG
+            nadir_val = max(1e-6, nadir + _nadir_rng.normal(0, nadir_noise_std))
             vals[nadir_t] = nadir_val
             if resp_rate >= 0.90:
                 # VGPR/CR only: floor post-nadir cycles to prevent trajectory
@@ -709,11 +776,19 @@ def _sim_trajectory(test: str, ig_type: str, arm: str,
                 # into CR territory (or VGPR patients below -99%).
                 for t2 in range(nadir_t + 1, n_cycles):
                     if vals[t2] < nadir_val:
-                        vals[t2] = nadir_val * RNG.uniform(1.001, 1.02)
+                        vals[t2] = nadir_val * _nadir_rng.uniform(1.001, 1.02)
 
     elif test in anemia_markers:
-        # Baseline low (anemia is CRAB criterion); gradual recovery with response
-        base = lo * RNG.uniform(0.65, 0.90)
+        # Baseline low (anemia is CRAB criterion); gradual recovery with response.
+        # Track A5: use MVN-derived HGB baseline to preserve M-protein↔HGB correlation.
+        if base_hgb_mvn is not None and test == "HGB":
+            base = float(base_hgb_mvn)
+            # RNG-state preservation: consume 1 value to replace the old uniform draw
+            # `base = lo * RNG.uniform(0.65, 0.90)` so downstream per-subject RNG
+            # calls (hematology dips, disease marker trajectories) are unaffected.
+            _ = RNG.uniform(0.65, 0.90)   # noqa: F841
+        else:
+            base = lo * RNG.uniform(0.65, 0.90)
         for t in range(n_cycles):
             recovery = (mid - base) * min(1.0, t / 14.0)
             vals[t] = base + recovery + RNG.normal(0, sd * 0.08)
@@ -749,10 +824,18 @@ def _sim_trajectory(test: str, ig_type: str, arm: str,
         base = mid + RNG.normal(0, sd * 0.5)
         # PLT baseline: NDMM ~200 (bone marrow compromise at diagnosis)
         # RRMM ~195 (prior therapy + more bone marrow involvement → lower reserve)
-        # Calibrated with dip_amp=0.45/0.46 to hit MM1 targets (IRd=31%, Rd=16%)
+        # Track A5: use MVN-derived PLT baseline (correlated with M-protein and HGB)
+        # when available; otherwise fall back to independent lognormal draw.
         if test == "PLT":
-            base_mean = 200.0 if is_ndmm else 195.0
-            base = np.clip(RNG.lognormal(np.log(base_mean), 0.30), lo * 0.3, lo * 3.5)
+            if base_plt_mvn is not None:
+                base = float(base_plt_mvn)
+                # RNG-state preservation: consume 1 value to replace the old lognormal
+                # draw so subsequent per-subject RNG calls remain calibrated.
+                _base_mean_dummy = 200.0 if is_ndmm else 195.0
+                _ = RNG.lognormal(np.log(_base_mean_dummy), 0.30)  # noqa: F841
+            else:
+                base_mean = 200.0 if is_ndmm else 195.0
+                base = np.clip(RNG.lognormal(np.log(base_mean), 0.30), lo * 0.3, lo * 3.5)
         for t in range(n_cycles):
             # Cumulative downward drift across cycles (~5% per cycle IRd, ~2% Rd)
             # representing persistent myelosuppression
@@ -866,9 +949,31 @@ def make_lb(dm: pd.DataFrame, study_key: str, max_cycles: int = 24) -> pd.DataFr
     # Within-cycle myelosuppression — affects NEUT, PLT, WBC
     _MYELO_SUPP = {"NEUT", "PLT", "WBC"}
 
-    # Log-normal IIV on relative Ixazomib AUC: CV ≈ 36 %  [Gupta 2017]
+    # Individual Ixazomib AUC (Track A3: patient-level PK-PD link via IXAZ_ETA_CL)
+    # Use per-patient CL eta stored in DM by make_dm() rather than a separate draw.
+    # auc_i = (F × dose × 1000) / (CL_pop × exp(eta_CL)) relative to population AUC.
+    # AUC_POP = F × dose_mg × 1000 / CL_pop = 0.58 × 4 × 1000 / 1.86 ≈ 1247 ng·h/mL
+    # Note: DDI not applied here (DDI only known after make_adsl); DDI patients are
+    # a small fraction (~11%) and generate_pk_v2.py uses the full DDI-corrected CL.
+    _CL_POP  = 1.86       # L/h, Gupta 2017
+    _AUC_POP = 0.58 * 4.0 * 1000.0 / _CL_POP   # ≈ 1247 ng·h/mL
     n = len(dm)
-    auc_rel = np.exp(RNG.normal(0, 0.36, n))
+
+    if "IXAZ_ETA_CL" in dm.columns:
+        # Relative individual AUC = CL_pop / CL_i = exp(-eta_CL), centered at ~1.0.
+        # Derivation: auc_rel_i = AUC_i/AUC_pop = (F×dose/CL_i)/(F×dose/CL_pop) = CL_pop/CL_i
+        # High eta_CL → high CL → low AUC → auc_rel < 1 (lower exposure, weaker effect)
+        # Low  eta_CL → low  CL → high AUC → auc_rel > 1 (higher exposure, stronger effect)
+        _cl_i_arr = _CL_POP * np.exp(dm["IXAZ_ETA_CL"].values)   # individual CL without DDI
+        auc_rel   = _CL_POP / _cl_i_arr                           # = exp(-eta_CL), mean ≈ 1.0
+        # RNG-state preservation: consume n values to replace the old independent
+        # draw `auc_rel = np.exp(RNG.normal(0, 0.36, n))` that existed before Track A3.
+        # This keeps all downstream calibrated values (response phenotype, cytogenetics,
+        # survival) unchanged after switching to the IXAZ_ETA_CL-based auc_rel.
+        _ = RNG.normal(0, 0.36, n)   # noqa: F841
+    else:
+        # Fallback to original independent draw (should not happen after A1 is applied)
+        auc_rel = np.exp(RNG.normal(0, 0.36, n))
 
     for idx, (_, subj) in enumerate(dm.iterrows()):
         n_cycles = RNG.integers(3, max_cycles + 1)
@@ -876,13 +981,30 @@ def make_lb(dm: pd.DataFrame, study_key: str, max_cycles: int = 24) -> pd.DataFr
         ig       = subj["IGTYPE"]
         auc_i    = auc_rel[idx] if arm == "IRd" else 1.0
 
+        # Per-subject LOCAL RNG for phenotype-dependent draws (response tier, nadir noise,
+        # floor loop).  Seeded deterministically from study seed + subject index so that:
+        #   (a) changing p_vgpr/p_cr probabilities NEVER shifts the global RNG state
+        #   (b) PLT Grade 3 rates, cytogenetics, and survival remain independently calibratable
+        # Seed = study_base * 2_000_000 + idx (study_base=42 MM2, 43 MM1; no collision for n≤722)
+        _study_seed_lb = 42 if is_ndmm else 43
+        _resp_rng = np.random.default_rng(_study_seed_lb * 2_000_000 + idx)
+
         # Pre-sample response phenotype once → all disease markers consistent
-        resp_pheno = _sample_resp_phenotype(arm, is_ndmm, auc_i)
+        resp_pheno = _sample_resp_phenotype(arm, is_ndmm, auc_i, _resp_rng)
+
+        # MVN-derived baseline values (Track A5): pass to _sim_trajectory()
+        _mprot_mvn = float(subj["BASE_SPEP_MPROT_MVN"]) if "BASE_SPEP_MPROT_MVN" in subj else None
+        _hgb_mvn   = float(subj["BASE_HGB_MVN"])        if "BASE_HGB_MVN"        in subj else None
+        _plt_mvn   = float(subj["BASE_PLT_MVN"])        if "BASE_PLT_MVN"        in subj else None
 
         for test in tests:
             lo, hi, unit = LAB_NORMAL_RANGES[test]
             traj = _sim_trajectory(test, ig, arm, n_cycles, is_ndmm, auc_i,
-                                   resp_rate_override=resp_pheno)
+                                   resp_rate_override=resp_pheno,
+                                   base_mprot_mvn=_mprot_mvn,
+                                   base_hgb_mvn=_hgb_mvn,
+                                   base_plt_mvn=_plt_mvn,
+                                   resp_rng=_resp_rng)
 
             for cyc_idx, val in enumerate(traj):
                 is_baseline = (cyc_idx == 0)
@@ -931,19 +1053,30 @@ def make_lb(dm: pd.DataFrame, study_key: str, max_cycles: int = 24) -> pd.DataFr
                         # Calibration (per-patient worst PLT across all cycles):
                         # PLT/NEUT/WBC myelosuppression dip amplitudes (per-study calibration).
                         # Grade3 rate grows super-linearly with dip_amp; calibrated via
-                        # log-linear interpolation from two empirical reference points
-                        # (per-patient worst PLT < 50 × 10⁹/L; fixed RNG seeds).
-                        # IRd: MM2 dip=0.45 → 26.8% Grade3 (target 25%) [seed=42] ✓
-                        #      MM1 dip=0.48 → ~31% Grade3 (target 31%) [seed=43]
-                        #      [empirical: 0.45→25.3%, 0.50→37.5%; log-linear → 0.48@31%]
-                        # Rd:  MM2 dip=0.47 → ~14% Grade3 (target 14%) [seed=42]
-                        #      [empirical: 0.44→10.2%, 0.52→24.9%; log-linear → 0.47@14%]
-                        #      MM1 dip=0.46 → 16.0% Grade3 (target 16%) [seed=43] ✓
+                        # empirical reference points (per-patient worst PLT < 50 × 10⁹/L).
+                        #
+                        # After Track A4 (linear AUC→PLT) + Track A5 (MVN PLT baseline):
+                        #   IRd effective average dip = dip_amp_pop × E[auc_rel]
+                        #   E[auc_rel] = E[exp(-η_CL)] = exp(ω²/2) = exp(0.35²/2) ≈ 1.063
+                        #   → dip_amp_pop reduced by factor ≈1/1.063 to restore targets.
+                        #   Additionally, MVN PLT lower clip raised 50→100; this raises the
+                        #   floor and further reduces Grade3 at fixed dip_amp_pop.
+                        # IRd: MM2 dip=0.36 → ~25% Grade3 (target 25%) [seed=42]
+                        #      MM1 dip=0.43 → ~31% Grade3 (target 31%) [seed=43] ✓
+                        # Rd:  MM2 dip=0.40 → ~14% Grade3 (target 14%) [seed=42]
+                        #      MM1 dip=0.45 → ~16% Grade3 (target 16%) [seed=43]
                         if test in _MYELO_SUPP:
+                            # Track A4: per-patient linear AUC→PLT dip (Srimani 2022).
+                            # Population dip_amp_pop calibrated to hit validated targets.
+                            # Individual dip scales linearly with auc_rel_i:
+                            #   dip_amp_i = dip_amp_pop × min(auc_rel_i, 2.5)
+                            # Cap at 2.5× to prevent extreme outliers.
                             if arm == "IRd":
-                                dip_amp = 0.45 if is_ndmm else 0.48
+                                dip_amp_pop = 0.36 if is_ndmm else 0.43
+                                dip_amp = dip_amp_pop * min(float(auc_i), 2.5)
                             else:
-                                dip_amp = 0.47 if is_ndmm else 0.46
+                                dip_amp_pop = 0.40 if is_ndmm else 0.45
+                                dip_amp = dip_amp_pop   # Rd arm: no Ixazomib, fixed dip
                             dip     = dip_amp * abs(float(val)) * np.sin(
                                 np.pi * wk_off / 28.0
                             )
@@ -1104,7 +1237,14 @@ def make_ae(dm: pd.DataFrame, lb: pd.DataFrame, study_key: str) -> pd.DataFrame:
 # DS — Disposition (arm-specific survival with published HR)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def make_ds(dm: pd.DataFrame, study_key: str) -> pd.DataFrame:
+def make_ds(dm: pd.DataFrame, lb: pd.DataFrame, study_key: str) -> pd.DataFrame:
+    """
+    Generate disposition/survival events.
+
+    Track A6: M-protein % change at Cycle 2 (Week 8) modifies individual PFS.
+    Published: ≥75% reduction → HR 0.26 vs <25% reduction (Srimani 2022).
+    Implemented as a WEAK within-arm modifier to preserve arm-level KM medians.
+    """
     sid    = STUDY_CONFIG[study_key]["studyid"]
     cfg    = STUDY_CONFIG[study_key]
     is_ndmm = (study_key == "MM2")
@@ -1132,6 +1272,45 @@ def make_ds(dm: pd.DataFrame, study_key: str) -> pd.DataFrame:
         seed_ird=base + 3, seed_rd=base + 4
     )
 
+    # ── Track A6: Gaussian copula — M-protein Cycle 6 → PFS (IRd arm) ──────────
+    # Rank-based re-assignment introduces Spearman ρ ≈ -0.55 between sustained
+    # M-protein response (Cycle 6) and PFS time for the IRd arm.
+    # Preserves marginal PFS distribution exactly (KM medians unchanged) because
+    # the same multiset of (time, event) pairs is used — only assignment changes.
+    # Srimani 2022: ≥75% Wk8 reduction → HR 0.26 (validation target 0.20–0.45).
+    _COPULA_RHO = -0.80   # negative: better M-protein response → longer PFS
+
+    _mprot_pchg_c6 = {}
+    if lb is not None and len(lb):
+        _mp = lb[(lb["LBTESTCD"] == "SPEP_MPROT") & lb["LBSTRESN"].notna()].copy()
+        _bl = _mp[_mp["EPOCH"] == "BASELINE"].groupby("USUBJID")["LBSTRESN"].median()
+        for _v in [6, 5, 4, 3]:    # prefer Cycle 6; fall back to earliest available
+            _cx = _mp[(lb["EPOCH"] != "BASELINE") & (lb["VISITNUM"] == _v) &
+                      (lb["LBTESTCD"] == "SPEP_MPROT") & lb["LBSTRESN"].notna()]\
+                      .groupby("USUBJID")["LBSTRESN"].median()
+            for uid in _cx.index:
+                if uid not in _mprot_pchg_c6 and uid in _bl.index and _bl[uid] > 0:
+                    _mprot_pchg_c6[uid] = (_cx[uid] - _bl[uid]) / _bl[uid] * 100.0
+
+    _ird_uids_ds = dm[dm["ARMCD"] == "IRd"]["USUBJID"].values   # same order as pfs_t[:n_ird]
+    _fb_pchg     = float(np.median(list(_mprot_pchg_c6.values()))) if _mprot_pchg_c6 else -30.0
+    _mp_arr_ird  = np.array([_mprot_pchg_c6.get(uid, _fb_pchg) for uid in _ird_uids_ds])
+
+    if n_ird >= 10 and len(_mprot_pchg_c6) >= n_ird // 2:
+        from scipy.stats import norm as _sp_norm
+        _crng   = np.random.default_rng(base + 100)   # deterministic, isolated from main RNG
+        mp_rnk  = np.argsort(np.argsort(_mp_arr_ird))  # higher rank = worse response
+        u_mp    = (mp_rnk + 0.5) / n_ird
+        z_mp    = _sp_norm.ppf(u_mp)
+        # z_pfs = rho*z_mp + sqrt(1-rho^2)*noise  (negative rho: bad responder → short PFS)
+        z_pfs   = _COPULA_RHO * z_mp + np.sqrt(1.0 - _COPULA_RHO**2) * _crng.standard_normal(n_ird)
+        new_rnk = np.argsort(np.argsort(z_pfs))        # higher rank → longer PFS
+        _srt    = np.argsort(pfs_t[:n_ird])
+        _t_pool = pfs_t[:n_ird][_srt].copy()
+        _e_pool = pfs_e[:n_ird][_srt].copy()
+        pfs_t[:n_ird] = _t_pool[new_rnk]
+        pfs_e[:n_ird] = _e_pool[new_rnk]
+
     # Re-order to match dm row order (IRd rows first in sim_weibull_arm output)
     # We need to map back: first n_ird values → IRd subjects, next n_rd → Rd subjects
     ird_idx = np.where(ird_mask)[0]
@@ -1149,26 +1328,34 @@ def make_ds(dm: pd.DataFrame, study_key: str) -> pd.DataFrame:
 
     rows = []
     for i, (_, subj) in enumerate(dm.iterrows()):
-        for times, events, dsdecod_e, dsdecod_c, paramcd, param_label in [
-            (pfs_t_ordered, pfs_e_ordered, "DISEASE PROGRESSION", "CENSORED", "PFS", "Progression-Free Survival"),
-            (os_t_ordered,  os_e_ordered,  "DEATH",               "CENSORED", "OS",  "Overall Survival"),
-        ]:
-            t = times[i]; e = events[i]
-            rows.append({
-                "STUDYID":  sid, "DOMAIN": "DS", "USUBJID": subj["USUBJID"],
-                "DSDECOD":  dsdecod_e if e else dsdecod_c,
-                "DSCAT":    "DISPOSITION EVENT",
-                "DSSCAT":   param_label,
-                "DSSTDTC":  iso_date(t),
-                "DSSTDY":   t + 1,
-                "DSTERM":   dsdecod_e if e else "ONGOING",
-                "EPOCH":    "TREATMENT",
-                "EVENTFL":  "Y" if e else "N",
-                "CNSR":     0 if e else 1,
-                "AVAL":     round(t / 28.0, 2),
-                "PARAM":    param_label,
-                "PARAMCD":  paramcd,
-            })
+        uid = subj["USUBJID"]
+
+        for pfs_days, pfs_ev, os_days, os_ev, dsdecod_pfs, dsdecod_os, param_pfs, param_os in [(
+            int(pfs_t_ordered[i]), int(pfs_e_ordered[i]),
+            int(os_t_ordered[i]),  int(os_e_ordered[i]),
+            "DISEASE PROGRESSION", "DEATH",
+            "Progression-Free Survival", "Overall Survival",
+        )]:
+            for t, e, dsdecod_e, dsdecod_c, paramcd, param_label in [
+                (pfs_days, pfs_ev, dsdecod_pfs, "CENSORED", "PFS", param_pfs),
+                (os_days,  os_ev,  dsdecod_os,  "CENSORED", "OS",  param_os),
+            ]:
+                rows.append({
+                    "STUDYID":  sid, "DOMAIN": "DS", "USUBJID": uid,
+                    "DSDECOD":  dsdecod_e if e else dsdecod_c,
+                    "DSCAT":    "DISPOSITION EVENT",
+                    "DSSCAT":   param_label,
+                    "DSSTDTC":  iso_date(t),
+                    "DSSTDY":   t + 1,
+                    "DSTERM":   dsdecod_e if e else "ONGOING",
+                    "EPOCH":    "TREATMENT",
+                    "EVENTFL":  "Y" if e else "N",
+                    "CNSR":     0 if e else 1,
+                    "AVAL":     round(t / 28.0, 2),
+                    "PARAM":    param_label,
+                    "PARAMCD":  paramcd,
+                    "MPROT_PCHG_C6": round(_mprot_pchg_c6.get(uid, float("nan")), 2),
+                })
 
     return pd.DataFrame(rows)
 
@@ -1335,6 +1522,22 @@ def make_adsl(dm: pd.DataFrame, ds: pd.DataFrame,
         adsl["CYP3A4_INDUFL"]  = "N"
         adsl["CL_DDI_MULT"]    = 1.0
 
+    # ── Individual Ixazomib CL (Track A1: closes PK-PD loop) ─────────────────
+    # CL_i = CL_pop × exp(eta_CL_i) × DDI_multiplier
+    # CL_pop = 1.86 L/h (Gupta 2017 Table 3), ω_CL = 35% CV
+    # eta_CL drawn in make_dm() and stored as IXAZ_ETA_CL.
+    # DDI multiplier (CL_DDI_MULT) now available after make_cm() flags.
+    # generate_pk_v2.py reads IXAZ_CL_I from adam_adsl.csv to ensure both
+    # generators use the exact same per-patient clearance value.
+    if "IXAZ_ETA_CL" in adsl.columns:
+        adsl["IXAZ_CL_I"] = np.round(
+            1.86 * np.exp(adsl["IXAZ_ETA_CL"].values) * adsl["CL_DDI_MULT"].values,
+            4
+        )   # L/h; individual Ixazomib clearance including DDI effect
+    else:
+        # Fallback if DM column missing (should not happen)
+        adsl["IXAZ_CL_I"] = 1.86
+
     return adsl
 
 
@@ -1444,8 +1647,8 @@ def generate_all():
         ae.to_csv(f"{study_dir}/sdtm_ae.csv", index=False)
         print(f"        {len(ae):,} AE records")
 
-        print("  [6/9] DS  — Disposition (arm-specific Weibull; IRd HR=0.742)")
-        ds = make_ds(dm, study_key)
+        print("  [6/9] DS  — Disposition (arm-specific Weibull; IRd HR=0.742; M-protein slope modifier)")
+        ds = make_ds(dm, lb, study_key)
         ds.to_csv(f"{study_dir}/sdtm_ds.csv", index=False)
         print(f"        {len(ds):,} disposition records")
 

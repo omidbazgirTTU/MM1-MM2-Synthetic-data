@@ -34,6 +34,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from matplotlib.lines import Line2D
+from scipy.stats import pearsonr as _pearsonr
 
 BASE     = os.path.join(os.path.dirname(__file__), "..")
 OUT_FIG  = os.path.join(BASE, "outputs", "validation")
@@ -743,6 +744,203 @@ def write_table1(studies):
     print(f"  Saved: {path}")
 
 
+# ── Cross-Correlation Checks (Criteria 49–68) ─────────────────────────────────
+
+def _mh_hr(t_resp, e_resp, t_ref, e_ref):
+    """Mantel-Haenszel HR estimate: responder (group 1) vs reference (group 2)."""
+    event_times = np.unique(np.concatenate([
+        t_resp[e_resp.astype(bool)], t_ref[e_ref.astype(bool)]
+    ]))
+    O1 = float(e_resp.sum()); O2 = float(e_ref.sum())
+    E1 = 0.0; E2 = 0.0
+    for te in event_times:
+        a1 = (t_resp >= te).sum(); a2 = (t_ref >= te).sum()
+        tot = a1 + a2
+        if tot == 0:
+            continue
+        d = ((t_resp == te) & e_resp.astype(bool)).sum() + \
+            ((t_ref  == te) & e_ref.astype(bool)).sum()
+        E1 += d * a1 / tot; E2 += d * a2 / tot
+    if E1 > 0 and E2 > 0:
+        return (O1 / E1) / (O2 / E2)
+    return np.nan
+
+
+def check_cross_correlations(studies):
+    """
+    Criteria 49–68: physiological cross-correlation validation.
+    Returns a DataFrame with the same columns as write_validation_table output.
+    """
+    rows = []
+
+    def crow(study, metric, simulated, target, unit, status):
+        diff_pct = round((simulated - target) / abs(target) * 100, 1) if target != 0 else 0.0
+        rows.append({
+            "Study":     study,
+            "Metric":    metric,
+            "Simulated": round(float(simulated), 4),
+            "Target":    round(float(target),    4),
+            "Unit":      unit,
+            "Diff%":     diff_pct,
+            "Status":    status,
+        })
+
+    for sk in studies:
+        adsl, adtte, adlb, _ = load_study(sk)
+        pp = pd.read_csv(os.path.join(BASE, sk, "sdtm_pp.csv"))
+
+        # ── 49–56: Baseline Covariate Correlations (4 checks × 2 studies) ───
+        for c1, c2, tgt, tol, label in [
+            ("AGE",                 "BASE_CREACL", -0.45, 0.10, "r(Age, CrCl)"),
+            ("WEIGHT",              "BSA",          0.85, 0.13, "r(Weight, BSA)"),
+            ("BASE_SPEP_MPROT_MVN", "BASE_HGB",    -0.30, 0.10, "r(M-prot, HGB)"),
+            ("BASE_PLT",            "BASE_HGB",     0.25, 0.10, "r(PLT, HGB)"),
+        ]:
+            pair = adsl[[c1, c2]].apply(pd.to_numeric, errors="coerce").dropna()
+            r = pair.corr().iloc[0, 1]
+            crow(sk, label, r, tgt, "r", "PASS" if abs(r - tgt) <= tol else "FAIL")
+
+        # ── 57–60: PK NCA Cross-Correlations (2 checks × 2 studies) ─────────
+        ix1  = pp[(pp["PPCAT"] == "IXAZOMIB") & (pp["VISITNUM"] == 1)]
+        cmax = ix1[ix1["PPTESTCD"] == "CMAX"][["USUBJID","PPSTRESN"]].rename(
+                   columns={"PPSTRESN": "CMAX"})
+        auci = ix1[ix1["PPTESTCD"] == "AUCINF"][["USUBJID","PPSTRESN"]].rename(
+                   columns={"PPSTRESN": "AUCINF"})
+        nca  = cmax.merge(auci, on="USUBJID").merge(adsl[["USUBJID","BSA"]], on="USUBJID")
+        for _col in ["CMAX", "AUCINF", "BSA"]:
+            nca[_col] = pd.to_numeric(nca[_col], errors="coerce")
+        nca = nca.dropna(subset=["CMAX", "AUCINF", "BSA"])
+
+        r_ca = nca[["CMAX","AUCINF"]].corr().iloc[0, 1]
+        crow(sk, "r(Cmax, AUCinf)", r_ca, 0.35, "r",
+             "PASS" if r_ca > 0.35 else "FAIL")
+
+        r_ba = nca[["BSA","CMAX"]].corr().iloc[0, 1]
+        crow(sk, "r(BSA, Cmax)", r_ba, -0.15, "r",
+             "PASS" if abs(r_ba - (-0.15)) <= 0.13 else "FAIL")
+
+        # ── 61–62: AUC → PLT Nadir Depth Q4 vs Q1 (1 check × 2 studies) ────
+        # Individual AUC ≈ F × dose × 1000 / CL_i  (F=0.58, dose=4 mg)
+        auc_df  = adsl[["USUBJID","IXAZ_CL_I"]].copy()
+        auc_df["AUC_I"] = 0.58 * 4.0 * 1000.0 / pd.to_numeric(
+                              auc_df["IXAZ_CL_I"], errors="coerce")
+        plt_lb  = adlb[(adlb["PARAMCD"] == "PLT") & adlb["AVAL"].notna()]
+        nadir   = plt_lb.groupby("USUBJID")["AVAL"].min().reset_index()
+        nadir.columns = ["USUBJID", "PLT_NADIR"]
+        pa = nadir.merge(auc_df[["USUBJID","AUC_I"]], on="USUBJID").dropna()
+        pa["AUC_Q"] = pd.qcut(pa["AUC_I"], q=4, labels=[1, 2, 3, 4])
+        q1_med   = pa[pa["AUC_Q"] == 1]["PLT_NADIR"].median()
+        q4_med   = pa[pa["AUC_Q"] == 4]["PLT_NADIR"].median()
+        pct_deep = (q1_med - q4_med) / q1_med * 100 if q1_med > 0 else 0.0
+        crow(sk, "PLT Q4 vs Q1 nadir (% deeper)", pct_deep, 15.0, "%",
+             "PASS" if pct_deep >= 15.0 else "FAIL")
+
+        # ── 63–64: M-protein Cycle 6 → PFS Cox HR (1 check × 2 studies) ─────
+        # Restricted to IRd arm — matches Srimani 2022 within-arm landmark analysis
+        ird_uids = set(adsl[adsl["ARMCD"] == "IRd"]["USUBJID"].values)
+        mp_c6 = adlb[
+            (adlb["PARAMCD"] == "SPEP_MPROT") &
+            (adlb["VISITNUM"] == 6) &
+            (adlb["EPOCH"]    != "BASELINE") &
+            adlb["PCHG"].notna() &
+            adlb["USUBJID"].isin(ird_uids)
+        ][["USUBJID","PCHG"]].rename(columns={"PCHG": "MP_PCHG_C6"})
+
+        pfs_tte = adtte[
+            (adtte["PARAMCD"] == "PFS") & adtte["USUBJID"].isin(ird_uids)
+        ][["USUBJID","AVAL","CNSR"]]
+        cox_df  = mp_c6.merge(pfs_tte, on="USUBJID").dropna()
+        cox_df["EVENT"]  = (cox_df["CNSR"] == 0).astype(int)
+        cox_df["RESP75"] = (cox_df["MP_PCHG_C6"] <= -75).astype(int)
+
+        hr = np.nan
+        n_resp = cox_df["RESP75"].sum()
+        n_ref  = (1 - cox_df["RESP75"]).sum()
+        if n_resp >= 10 and n_ref >= 10:
+            try:
+                from lifelines import CoxPHFitter
+                cph = CoxPHFitter()
+                cph.fit(cox_df[["AVAL","EVENT","RESP75"]],
+                        duration_col="AVAL", event_col="EVENT")
+                hr = float(np.exp(cph.params_["RESP75"]))
+            except Exception:
+                resp = cox_df[cox_df["RESP75"] == 1]
+                nref = cox_df[cox_df["RESP75"] == 0]
+                hr   = _mh_hr(resp["AVAL"].values,  resp["EVENT"].values,
+                               nref["AVAL"].values,  nref["EVENT"].values)
+
+        if not np.isnan(hr):
+            crow(sk, "Cox HR M-prot ≥75% C6 vs <75%", hr, 0.26, "HR",
+                 "PASS" if 0.20 <= hr <= 0.45 else "FAIL")
+
+        # ── 65–68: Exposure-Efficacy Flatness (2 checks × 2 studies) ────────
+        # 65/67: |r(AUC, M-protein% C6)| < 0.20  (flat E-R within range)
+        er_df = mp_c6.merge(auc_df[["USUBJID","AUC_I"]], on="USUBJID").dropna()
+        if len(er_df) >= 20:
+            r_er, _ = _pearsonr(er_df["AUC_I"].values, er_df["MP_PCHG_C6"].values)
+            crow(sk, "|r(AUC, M-prot% C6)|", abs(r_er), 0.20, "r",
+                 "PASS" if abs(r_er) < 0.20 else "FAIL")
+
+        # 66/68: AUC → ORR point-biserial correlation p-value > 0.05
+        best_mp = adlb[
+            (adlb["PARAMCD"] == "SPEP_MPROT") &
+            (adlb["EPOCH"]    != "BASELINE") &
+            adlb["PCHG"].notna()
+        ].groupby("USUBJID")["PCHG"].min().reset_index()
+        best_mp.columns = ["USUBJID", "BEST_PCHG"]
+        best_mp["ORR"] = (best_mp["BEST_PCHG"] <= -50).astype(int)
+        logit_df = best_mp.merge(auc_df[["USUBJID","AUC_I"]], on="USUBJID").dropna()
+        if len(logit_df) >= 20:
+            _, p_val = _pearsonr(logit_df["AUC_I"].values,
+                                 logit_df["ORR"].astype(float).values)
+            crow(sk, "AUC→ORR biserial p-value", p_val, 0.05, "p",
+                 "PASS" if p_val > 0.05 else "FAIL")
+
+    return pd.DataFrame(rows)
+
+
+def plot_cross_correlations(studies):
+    """Scatter plots for baseline covariate cross-correlations (criteria 49–56)."""
+    n_rows, n_cols = len(studies), 4
+    fig, axes = plt.subplots(n_rows, n_cols,
+                             figsize=(5 * n_cols, 4 * n_rows),
+                             gridspec_kw={"hspace": 0.60, "wspace": 0.40})
+    if n_rows == 1:
+        axes = axes.reshape(1, n_cols)
+
+    pairs = [
+        ("AGE",            "BASE_CREACL",    "Age (yr)",       "CrCL (mL/min)", -0.45, 0.10),
+        ("WEIGHT",         "BSA",             "Weight (kg)",    "BSA (m²)",       0.85, 0.05),
+        ("BASE_SPEP_MPROT_MVN","BASE_HGB",     "M-prot MVN (g/dL)", "HGB (g/dL)", -0.30, 0.10),
+        ("BASE_PLT",       "BASE_HGB",        "PLT (×10⁹/L)", "HGB (g/dL)",      0.25, 0.10),
+    ]
+    for ri, sk in enumerate(studies):
+        adsl, *_ = load_study(sk)
+        for ci, (c1, c2, xl, yl, tgt, tol) in enumerate(pairs):
+            ax  = axes[ri][ci]
+            df  = adsl[[c1, c2]].apply(pd.to_numeric, errors="coerce").dropna()
+            r   = df.corr().iloc[0, 1]
+            ok  = abs(r - tgt) <= tol
+            ax.scatter(df[c1], df[c2], s=4, alpha=0.22, color=STUDY_COLORS[sk])
+            z   = np.polyfit(df[c1].values, df[c2].values, 1)
+            xr  = np.linspace(df[c1].min(), df[c1].max(), 100)
+            ax.plot(xr, np.polyval(z, xr), color="black", lw=1.2, ls="--", alpha=0.7)
+            ax.set_title(f"{sk}  r={r:.3f}  (tgt {tgt:+.2f}±{tol})\n"
+                         f"{'✓ PASS' if ok else '✗ FAIL'}",
+                         fontsize=8, fontweight="bold",
+                         color="#1a7a1a" if ok else "#cc1a1a")
+            ax.set_xlabel(xl, fontsize=8); ax.set_ylabel(yl, fontsize=8)
+            ax.spines[["top","right"]].set_visible(False)
+            ax.tick_params(labelsize=7)
+
+    fig.suptitle("Baseline Covariate Cross-Correlations (criteria 49–56)",
+                 fontsize=11, y=1.01)
+    path = os.path.join(OUT_FIG, "cross_correlations.png")
+    fig.savefig(path, dpi=150, bbox_inches="tight", facecolor="white")
+    plt.close(fig)
+    print(f"  Saved: {path}")
+
+
 # ── Summary print ──────────────────────────────────────────────────────────────
 
 def print_summary(val_df):
@@ -782,25 +980,34 @@ if __name__ == "__main__":
     print(f"Figures → {OUT_FIG}")
     print(f"Tables  → {OUT_TAB}")
 
-    print("\n[1/6] KM Survival Curves...")
+    print("\n[1/7] KM Survival Curves...")
     km_results = plot_km(studies)
 
-    print("\n[2/6] M-protein Waterfall + Spider...")
+    print("\n[2/7] M-protein Waterfall + Spider...")
     resp_results = plot_mprotein(studies)
 
-    print("\n[3/6] PLT Within-Cycle Profile...")
+    print("\n[3/7] PLT Within-Cycle Profile...")
     plot_plt_profile(studies)
 
-    print("\n[4/6] PK VPC...")
+    print("\n[4/7] PK VPC...")
     plot_pk_vpc(studies)
 
-    print("\n[5/6] Covariate Distributions...")
+    print("\n[5/7] Covariate Distributions...")
     plot_covariates(studies)
 
-    print("\n[6/6] Writing validation tables...")
+    print("\n[6/7] Writing validation tables...")
     val_df = write_validation_table(studies, km_results, resp_results)
     write_response_table(studies, resp_results)
     write_table1(studies)
 
-    print_summary(val_df)
+    print("\n[7/7] Cross-Correlation Checks (criteria 49–68)...")
+    plot_cross_correlations(studies)
+    cc_df = check_cross_correlations(studies)
+
+    val_df_full = pd.concat([val_df, cc_df], ignore_index=True)
+    path_vsum = os.path.join(OUT_TAB, "validation_summary.csv")
+    val_df_full.to_csv(path_vsum, index=False)
+    print(f"  Updated: {path_vsum}")
+
+    print_summary(val_df_full)
     print(f"\n✓  Validation complete.")

@@ -72,14 +72,16 @@ MM1/
 MM2/
 
 # ── Large outputs — figures and generated artefacts ───────────────────────────
-# Individual patient figures (1,400+ PNGs) are reproducible from scripts
-outputs/figures/MM1/
-outputs/figures/MM2/
+# All outputs are reproducible by running scripts/validate_data.py
+outputs/figures/
+outputs/validation/
+outputs/tables/
 
-# Keep top-level VPC/GOF figures and the validation report
-# outputs/figures/pk_vpc_*.png  → tracked
-# outputs/figures/pk_gof_*.png  → tracked
-# outputs/VALIDATION_REPORT.md  → tracked
+# Root-level duplicate skill files (canonical versions live in .claude/skills/)
+/Cross_Correlations_Synthetic_Data_Guide.md
+
+# Legacy scripts (superseded by generate_v2.py / generate_pk_v2.py)
+/generate_pk.py
 
 # ── Miscellaneous ─────────────────────────────────────────────────────────────
 *.log

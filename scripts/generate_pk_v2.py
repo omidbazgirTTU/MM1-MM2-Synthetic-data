@@ -173,6 +173,14 @@ def sample_ixaz(adsl):
     Covariates applied:
       - BSA on V4: V4 = TV_V4 * (BSA/1.73)^0.70  [Gupta 2017]
       - CYP3A4 DDI on CL: CL *= CL_DDI_MULT from ADSL
+
+    Track A2 — OMEGA Cholesky for correlated PK etas (CL, V2, V4):
+      Off-diagonals from Cross_Correlations_Synthetic_Data_Guide.md §2B (assumed):
+        Cov(CL,V2)=0.042 (r=0.40), Cov(CL,V4)=0.046 (r=0.29), Cov(V2,V4)=0.027 (r=0.20)
+
+    Track A1/A3 — If IXAZ_CL_I exists in ADSL (set by generate_v2.py make_adsl()),
+      use that pre-computed CL_i directly instead of re-sampling, ensuring both
+      generators use the EXACT same per-patient clearance value.
     """
     p = PK_DRUGS["IXAZOMIB"]; n = len(adsl)
 
@@ -185,16 +193,52 @@ def sample_ixaz(adsl):
     # CYP3A4 DDI multiplier on CL
     ddi_mult = adsl["CL_DDI_MULT"].values if "CL_DDI_MULT" in adsl.columns else np.ones(n)
     ddi_mult = np.where(np.isnan(ddi_mult.astype(float)), 1.0, ddi_mult.astype(float))
-    cl_base  = p["CL"] * eta(p["iiv_CL"], n) * ddi_mult
+
+    # ── Track A2: OMEGA Cholesky for correlated CL, V2, V4 etas ─────────────
+    # OMEGA matrix (variances + covariances):
+    #   ω_CL=0.35, ω_V2=0.30, ω_V4=0.45 [Gupta 2017 IIV estimates]
+    #   Off-diagonal covariances assumed (correlations not published for Ixazomib)
+    _OMEGA = np.array([
+        [0.1225, 0.042,  0.046],   # CL: ω²=0.35², Cov(CL,V2), Cov(CL,V4)
+        [0.042,  0.09,   0.027],   # V2: ω²=0.30²
+        [0.046,  0.027,  0.2025],  # V4: ω²=0.45²
+    ])
+    _L_omega = np.linalg.cholesky(_OMEGA)
+
+    if "IXAZ_CL_I" in adsl.columns:
+        # ── Track A1/A3: read pre-computed CL_i from ADSL ─────────────────────
+        # CL_i already includes DDI correction (computed in make_adsl()).
+        # For V2 and V4 etas: draw from conditional distribution given eta_CL.
+        # Simplified: recover eta_CL from stored CL_i, then use OMEGA Cholesky
+        # to get correlated eta_V2, eta_V4 conditional on eta_CL.
+        cl_base   = adsl["IXAZ_CL_I"].values.astype(float)
+        cl_base   = np.where(np.isnan(cl_base) | (cl_base <= 0), p["CL"], cl_base)
+        eta_cl    = np.log(cl_base / (p["CL"] * ddi_mult))  # recover eta_CL
+
+        # Conditional draw for eta_V2, eta_V4 given eta_CL:
+        # Cholesky: eta_raw = L^{-1} @ eta → eta_raw[0] = eta_CL / L[0,0]
+        # Remaining rows: eta_raw[1,2] ~ N(0,1) independent → correlated etas
+        eta_raw_0 = eta_cl / _L_omega[0, 0]           # standardized CL component
+        eta_raw_12 = RNG.standard_normal((n, 2))       # independent V2, V4 components
+        eta_v2 = _L_omega[1, 0] * eta_raw_0 + _L_omega[1, 1] * eta_raw_12[:, 0]
+        eta_v4 = _L_omega[2, 0] * eta_raw_0 + _L_omega[2, 1] * eta_raw_12[:, 0] \
+               + _L_omega[2, 2] * eta_raw_12[:, 1]
+    else:
+        # Fallback: draw all 3 etas jointly from OMEGA Cholesky
+        eta_raw = RNG.standard_normal((n, 3))
+        etas    = ((_L_omega @ eta_raw.T).T)   # shape (n, 3): [η_CL, η_V2, η_V4]
+        cl_base = p["CL"] * np.exp(etas[:, 0]) * ddi_mult
+        eta_v2  = etas[:, 1]
+        eta_v4  = etas[:, 2]
 
     return pd.DataFrame({
         "USUBJID": adsl["USUBJID"].values,
         "CL_i":  cl_base,
-        "V2_i":  p["V2"] * eta(p["iiv_V2"], n),
+        "V2_i":  p["V2"] * np.exp(eta_v2),
         "Q3_i":  p["Q3"] * eta(p["iiv_Q3"], n),
         "V3_i":  p["V3"] * eta(p["iiv_V3"], n),
         "Q4_i":  p["Q4"] * eta(p["iiv_Q4"], n),
-        "V4_i":  v4_bsa  * eta(p["iiv_V4"], n),
+        "V4_i":  v4_bsa  * np.exp(eta_v4),
         "Ka_i":  p["Ka"] * eta(p["iiv_Ka"], n),
         "F_i":   np.clip(p["F"] * eta(p["iiv_F"], n), 0.1, 1.0),
         "ALAG":  p["ALAG1"],
