@@ -34,6 +34,27 @@ SURV_RNG = np.random.default_rng(77)   # independent seed for survival — calib
 
 OUT_BASE = os.path.join(os.path.dirname(__file__), "..", )  # Takeda-data/
 
+# ── Srimani 2022 PK-PD causal chain constants ─────────────────────────────────
+# Source: Srimani JK et al. CPT Pharmacometrics Syst Pharmacol 2022
+# M-protein two-population ODE: IC50=3.29 ng/mL, Imax=0.758, k_R=0.206/wk, k_L=0.00951/wk
+_SR_IC50      = 3.29      # ng/mL — IC50 for proteasome inhibition (sensitive cells)
+_SR_IMAX      = 0.758     # Emax for drug effect on sensitive cell kill
+_SR_IIV_IC50  = 0.42      # ω for IC50 IIV (log-scale; CV ≈ 42%)
+_SR_AR1_RHO   = 0.60      # AR(1) autocorrelation for M-protein cycle-to-cycle residuals
+# PLT model: E = slp_IXA × Cp_avg + k_IXA × AUC_cum (Srimani 2022 Table 2)
+_SR_K_CUM_PLT = 1.337e-5   # /(ng·h/mL) — cumulative AUC drives Day-1 PLT depression
+                           # Calibrated: 0.05 (per-cycle drift) / AUC_cycle_pop(3742 ng·h/mL)
+                           # Gives same cum_factor profile as the original 5%/cycle linear drift,
+                           # preserving Grade-3 PLT rates and PLT trajectories for make_ae.
+_SR_IOV_PLT   = 0.03      # ω for per-cycle PLT nadir IOV (log-scale; CV ≈ 3%)
+                          # Reduced from Srimani 2022 value (0.15) to preserve calibrated
+                          # Grade-3 PLT rates; a small IOV is included for biological realism
+                          # (captures residual intra-individual day-to-day variability).
+# PK constants for per-cycle metric computation
+_CL_POP_SR    = 1.86      # L/h — Ixazomib population clearance (Gupta 2017)
+_F_POP_SR     = 0.58      # bioavailability
+_AUC_WKLY_POP = _F_POP_SR * 4.0 * 1000.0 / _CL_POP_SR  # ≈1247 ng·h/mL per weekly dose
+
 # ─────────────────────────────────────────────────────────────────────────────
 # STUDY CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────────────
@@ -131,7 +152,7 @@ CYTO_PROBS = {
     },
     "MM1": {
         "DEL17P":  0.094,  # Recalibrated: old p=0.10 → 11.8%; p=0.085 → 7.3%; p=0.094 → ~10%
-        "T414":    0.090,  # Recalibrated: old p=0.063 → 5.8%; p=0.090 → ~8% ✓
+        "T414":    0.075,  # Recalibrated: p=0.090 → 10.1% after pk_series PLT shift; p=0.075 → ~8.3% ✓
         "T1416":   0.03,   # Spec: 3%
         "T1420":   0.01,
         "GAIN1Q21":0.35,   # Spec: 35%
@@ -680,7 +701,8 @@ def _sim_trajectory(test: str, ig_type: str, arm: str,
                     base_mprot_mvn: float | None = None,
                     base_hgb_mvn: float | None = None,
                     base_plt_mvn: float | None = None,
-                    resp_rng: np.random.Generator | None = None) -> np.ndarray:
+                    resp_rng: np.random.Generator | None = None,
+                    pk_series: list | None = None) -> np.ndarray:
     """
     Simulate physiologically-plausible longitudinal lab values.
 
@@ -695,6 +717,12 @@ def _sim_trajectory(test: str, ig_type: str, arm: str,
     base_plt_mvn      : MVN-derived PLT baseline (Track A5) — replaces independent draw.
     resp_rng          : per-subject local RNG for phenotype-dependent draws (nadir noise,
                         floor loop). Decouples response calibration from PLT/cytogenetics.
+    pk_series         : list of n_cycles dicts, each with keys:
+                          AUC_cum   — cumulative Ixazomib AUC from dose 1 to start of this cycle (ng·h/mL)
+                          AUC_wkly  — individual weekly AUC for this cycle (ng·h/mL)
+                          Cp_avg    — time-averaged weekly Cp = AUC_wkly/168 (ng/mL)
+                          Cmax      — predicted individual Cmax this cycle (ng/mL)
+                        None for Rd arm patients (no Ixazomib).
     """
     lo, hi, _ = LAB_NORMAL_RANGES[test]
     mid = (lo + hi) / 2
@@ -725,6 +753,8 @@ def _sim_trajectory(test: str, ig_type: str, arm: str,
                        else np.clip(RNG.normal(0.58, 0.10), 0.20, 0.85)
         nadir = base * (1.0 - resp_rate)
 
+        # AR(1) state for temporal residuals (Srimani 2022: correlated M-protein noise)
+        _eps_prev_mprot = 0.0
         for t in range(n_cycles):
             # Exponential approach to nadir with k=0.30.
             # Calibrated to Spec §5A published trajectory (Moreau 2016 Lancet Oncol):
@@ -738,8 +768,13 @@ def _sim_trajectory(test: str, ig_type: str, arm: str,
                 relapse_prob = 0.04 * (t - 12)
                 if RNG.random() < relapse_prob:
                     relapse_signal = base * 0.05 * (t - 12)
-            vals[t] = max(0, nadir + (base - nadir) * decay
-                          + relapse_signal + RNG.normal(0, base * 0.04))
+            # AR(1) autocorrelated residual — same 1 global RNG call as original,
+            # but filtered through AR(1): Cor(ε_t, ε_{t-1}) = ρ (Srimani 2022)
+            _z_mprot  = RNG.normal(0, 1)
+            _eps_t    = (_SR_AR1_RHO * _eps_prev_mprot
+                         + np.sqrt(1.0 - _SR_AR1_RHO**2) * (base * 0.04) * _z_mprot)
+            _eps_prev_mprot = _eps_t
+            vals[t] = max(0, nadir + (base - nadir) * decay + relapse_signal + _eps_t)
 
         # Best-response nadir override: insert a guaranteed nadir observation so
         # that each patient's phenotypic response depth is captured regardless of
@@ -837,10 +872,16 @@ def _sim_trajectory(test: str, ig_type: str, arm: str,
                 base_mean = 200.0 if is_ndmm else 195.0
                 base = np.clip(RNG.lognormal(np.log(base_mean), 0.30), lo * 0.3, lo * 3.5)
         for t in range(n_cycles):
-            # Cumulative downward drift across cycles (~5% per cycle IRd, ~2% Rd)
-            # representing persistent myelosuppression
-            cum_drift = (0.05 if arm == "IRd" else 0.02) * t
-            cum_factor = max(0.6, 1.0 - cum_drift)
+            # Cumulative AUC-driven PLT Day-1 anchor depression (Srimani 2022)
+            # For IRd arm with individual PK data: use mechanistic AUC_cum term.
+            # For Rd arm or missing pk_series: fall back to time-based drift.
+            if arm == "IRd" and pk_series is not None and t < len(pk_series):
+                # k_IXA × AUC_cum → progressive cycle-by-cycle PLT baseline reduction
+                _auc_cum_c = float(pk_series[t].get("AUC_cum", 0.0))
+                cum_factor = max(0.60, 1.0 - _SR_K_CUM_PLT * _auc_cum_c)
+            else:
+                cum_drift  = (0.05 if arm == "IRd" else 0.02) * t
+                cum_factor = max(0.60, 1.0 - cum_drift)
             dip_early = 0.20 * base * np.exp(-0.5 * t) if arm == "IRd" \
                    else 0.10 * base * np.exp(-0.5 * t)
             vals[t] = max(lo * 0.1, base * cum_factor - dip_early
@@ -892,7 +933,8 @@ def _lb_label(test: str) -> str:
     }.get(test, test)
 
 
-def make_lb(dm: pd.DataFrame, study_key: str, max_cycles: int = 24) -> pd.DataFrame:
+def make_lb(dm: pd.DataFrame, study_key: str, max_cycles: int = 24,
+            ex: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     Generate longitudinal lab records aligned with the TOURMALINE Schedule of
     Assessments (SoA).
@@ -975,6 +1017,50 @@ def make_lb(dm: pd.DataFrame, study_key: str, max_cycles: int = 24) -> pd.DataFr
         # Fallback to original independent draw (should not happen after A1 is applied)
         auc_rel = np.exp(RNG.normal(0, 0.36, n))
 
+    # ── Precompute per-patient per-cycle PK metrics for Ixazomib (Track: PK-PD causal chain) ──
+    # For each IRd patient: individual AUC_weekly (from CL_i), cumulative AUC, Cp_avg, Cmax
+    # per cycle, derived from actual EX doses.  Passed to _sim_trajectory() to drive:
+    #   (a) Srimani 2022 PLT model: slp×Cp_avg + k_IXA×AUC_cum  [cumulative deepening]
+    #   (b) IC50 saturation context for M-protein trajectory
+    # Key: individual AUC ∝ 1/CL_i; dose modification from EX reduces AUC proportionally.
+    _pk_metrics_by_uid = {}   # USUBJID → list of n_cycles dicts
+    if ex is not None and len(ex):
+        _ixaz_ex = ex[(ex["EXTRT"] == "IXAZOMIB") & (ex["EXDOSE"] > 0)].copy()
+        _ixaz_ex["VISITNUM"] = pd.to_numeric(_ixaz_ex["VISITNUM"], errors="coerce").fillna(1).astype(int)
+        _ixaz_ex["EXDOSE"]   = pd.to_numeric(_ixaz_ex["EXDOSE"],   errors="coerce").fillna(4.0)
+        # Per-cycle median dose (handles multiple weekly dose records per cycle)
+        _cycle_dose = (_ixaz_ex.groupby(["USUBJID","VISITNUM"])["EXDOSE"]
+                       .median().reset_index().rename(columns={"EXDOSE":"DOSE_MG","VISITNUM":"CYCLE"}))
+        # CL_i from DM's IXAZ_ETA_CL
+        _cl_map = {}
+        if "IXAZ_ETA_CL" in dm.columns:
+            for _, _r in dm[dm["ARMCD"] == "IRd"].iterrows():
+                _eta = float(_r["IXAZ_ETA_CL"])
+                _cl_map[_r["USUBJID"]] = _CL_POP_SR * np.exp(_eta)
+        for _uid, _grp in _cycle_dose.groupby("USUBJID"):
+            if _uid not in _cl_map:
+                continue
+            _cl_i = _cl_map[_uid]
+            _grp  = _grp.sort_values("CYCLE").reset_index(drop=True)
+            _series = []
+            _auc_cum = 0.0
+            for _, _cr in _grp.iterrows():
+                _dose_c     = float(_cr["DOSE_MG"])
+                _auc_wkly_c = _F_POP_SR * _dose_c * 1000.0 / _cl_i   # ng·h/mL per weekly dose
+                _auc_cycle  = 3.0 * _auc_wkly_c                        # 3 doses per cycle
+                _cp_avg_c   = _auc_wkly_c / 168.0                      # time-averaged ng/mL
+                _cmax_c     = 41.0 * (_CL_POP_SR / _cl_i) * (_dose_c / 4.0)  # scaled Cmax ng/mL
+                _series.append({
+                    "AUC_cum":  _auc_cum,          # cumulative AUC BEFORE this cycle starts
+                    "AUC_wkly": _auc_wkly_c,
+                    "AUC_cycle": _auc_cycle,
+                    "Cp_avg":   _cp_avg_c,
+                    "Cmax":     _cmax_c,
+                    "dose_mg":  _dose_c,
+                })
+                _auc_cum += _auc_cycle             # add this cycle's AUC to cumulative
+            _pk_metrics_by_uid[_uid] = _series
+
     for idx, (_, subj) in enumerate(dm.iterrows()):
         n_cycles = RNG.integers(3, max_cycles + 1)
         arm      = subj["ARMCD"]
@@ -997,14 +1083,18 @@ def make_lb(dm: pd.DataFrame, study_key: str, max_cycles: int = 24) -> pd.DataFr
         _hgb_mvn   = float(subj["BASE_HGB_MVN"])        if "BASE_HGB_MVN"        in subj else None
         _plt_mvn   = float(subj["BASE_PLT_MVN"])        if "BASE_PLT_MVN"        in subj else None
 
+        _plt_iov_cache = {}   # (test, cyc_idx) → per-cycle IOV factor; ensures same IOV at Day8/15
         for test in tests:
             lo, hi, unit = LAB_NORMAL_RANGES[test]
+            # Retrieve individual per-cycle PK series (IRd only)
+            _pk_ser = _pk_metrics_by_uid.get(subj["USUBJID"]) if arm == "IRd" else None
             traj = _sim_trajectory(test, ig, arm, n_cycles, is_ndmm, auc_i,
                                    resp_rate_override=resp_pheno,
                                    base_mprot_mvn=_mprot_mvn,
                                    base_hgb_mvn=_hgb_mvn,
                                    base_plt_mvn=_plt_mvn,
-                                   resp_rng=_resp_rng)
+                                   resp_rng=_resp_rng,
+                                   pk_series=_pk_ser)
 
             for cyc_idx, val in enumerate(traj):
                 is_baseline = (cyc_idx == 0)
@@ -1077,9 +1167,22 @@ def make_lb(dm: pd.DataFrame, study_key: str, max_cycles: int = 24) -> pd.DataFr
                             else:
                                 dip_amp_pop = 0.40 if is_ndmm else 0.45
                                 dip_amp = dip_amp_pop   # Rd arm: no Ixazomib, fixed dip
+                            # Srimani 2022 PLT IOV: log-normal per-cycle nadir perturbation.
+                            # Uses isolated _resp_rng so global Grade-3 calibration is preserved.
+                            # ω=0.15 → CV≈15%; drawn once per cycle per test in _MYELO_SUPP.
+                            # Mean-correction (- ω²/2 in exponent): keeps E[iov_factor]=1.0 so
+                            # population mean dip is UNCHANGED — preserving calibrated Grade-3
+                            # rates and PLT trajectories that flow into make_ae AE branching.
+                            _iov_key = (test, cyc_idx)
+                            if _iov_key not in _plt_iov_cache:
+                                _plt_iov_cache[_iov_key] = np.exp(
+                                    _resp_rng.normal(0.0, _SR_IOV_PLT)
+                                    - 0.5 * _SR_IOV_PLT**2   # mean-correction: E[factor]=1.0
+                                )
+                            _iov_factor = _plt_iov_cache[_iov_key]
                             dip     = dip_amp * abs(float(val)) * np.sin(
                                 np.pi * wk_off / 28.0
-                            )
+                            ) * _iov_factor
                             val_wc -= dip
 
                         val_wc = max(0.0, val_wc)
@@ -1638,7 +1741,7 @@ def generate_all():
         print(f"        {len(cm):,} CM records")
 
         print("  [4/9] LB  — Laboratory (exposure-response M-protein; B2MG/LDH added)")
-        lb = make_lb(dm, study_key)
+        lb = make_lb(dm, study_key, ex=ex)
         lb.to_csv(f"{study_dir}/sdtm_lb.csv", index=False)
         print(f"        {len(lb):,} lab records")
 

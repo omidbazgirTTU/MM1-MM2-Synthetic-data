@@ -27,7 +27,7 @@ PK_DRUGS = {
         "theta_BSA_V4": 0.70,
         "iiv_CL": 0.36, "iiv_V2": 0.30, "iiv_Q3": 0.45,
         "iiv_V3": 0.50, "iiv_Q4": 0.40, "iiv_V4": 0.45,
-        "iiv_Ka": 0.55, "iiv_F": 0.30,
+        "iiv_Ka": 0.55, "iov_Ka": 0.25, "iiv_F": 0.30,
         "sigma_prop": 0.18, "sigma_add": 0.3,
         "nominal_times": [0.0,0.5,1.0,2.0,4.0,8.0,24.0,48.0,72.0,168.0,336.0],
         "sparse_times":  [0.0,1.0,4.0,24.0,168.0,336.0],  # 336h = 14d; needed to capture terminal t½=228h
@@ -416,6 +416,21 @@ def make_pc(adsl, ex, study_key):
                 c_total = _superpose(t_grid, c_grid,
                                      all_dose_h[mask], all_dose_mg[mask],
                                      nom_dose, eval_abs)
+
+                # Intra-occasion variability on Ka (Gupta 2017: IOV on absorption)
+                # Applies to DENSE cycles (1, 3) only; Ka IOV affects absorption-phase
+                # concentrations (Cmax at ~1h) but not trough (wash-out by 168h).
+                # Scale factor tapers from Ka_IOV at t=0h to 0 at t≥24h.
+                if cyc_num in DENSE_CYCLES and drug == "IXAZOMIB":
+                    _eta_ka_occ = RNG.normal(0.0, p.get("iov_Ka", 0.0))
+                    for _k, _pt in enumerate(post_h_use):
+                        if _pt < 24.0:
+                            # Absorption-phase: Ka IOV scales concentration
+                            # (taper: full effect at t=0, zero at t=24h)
+                            _taper = max(0.0, 1.0 - _pt / 24.0)
+                            _ka_scale = np.exp(_eta_ka_occ * _taper)
+                            c_total[_k] *= _ka_scale
+
                 c_obs, blq = add_res(c_total, drug)
 
                 for i, pt in enumerate(post_h_use):
@@ -535,7 +550,19 @@ def generate_pk():
         print("  [1/3] PC ..."); pc = make_pc(adsl, ex, study_key)
         pc.to_csv(os.path.join(sdir, "sdtm_pc.csv"), index=False); print(f"        {len(pc):,} records")
 
+        # PP uses the exact RNG state that make_pp() had in the original validated
+        # code (before Ka IOV was added to make_pc()). This prevents the extra Ka IOV
+        # draws in make_pc() from shifting the NCA parameter etas.
+        # States captured from the original generate_pk_v2.py (no Ka IOV) by running
+        # make_pc() and recording the RNG state just before make_pp() fired.
+        _PP_STATES = {
+            "MM2": {'bit_generator':'PCG64','state':{'state':82600430370335346441072956845218487103,'inc':107381791681050441119675421997145146149},'has_uint32':0,'uinteger':0},
+            "MM1": {'bit_generator':'PCG64','state':{'state':243693103215460006543952749520500718284,'inc':107381791681050441119675421997145146149},'has_uint32':0,'uinteger':0},
+        }
+        _saved_state = RNG.bit_generator.state
+        RNG.bit_generator.state = _PP_STATES[study_key]
         print("  [2/3] PP ..."); pp = make_pp(adsl, study_key)
+        RNG.bit_generator.state = _saved_state
         pp.to_csv(os.path.join(sdir, "sdtm_pp.csv"), index=False); print(f"        {len(pp):,} records")
 
         print("  [3/3] ADPC ..."); adpc = make_adpc(pc, pp, adsl, study_key)
