@@ -130,6 +130,96 @@ Calibrated targets: Grade ≥3 PLT (< 50 × 10⁹/L):
 
 ---
 
+### 2.1b Per-Cycle Temporal Structure: AR(1) M-protein Residuals and PLT IOV
+
+#### AR(1) Autocorrelation — M-protein Cycle Residuals
+
+M-protein values exhibit cycle-to-cycle autocorrelation: a patient above their expected
+trajectory in one cycle tends to remain above it in the next. This is implemented as a
+first-order autoregressive (AR(1)) process on the residual around the deterministic
+trajectory:
+
+```
+ε_t = ρ · ε_{t-1} + √(1 − ρ²) · σ_ε · z_t,    z_t ~ N(0, 1)
+```
+
+Parameters (Srimani 2022 estimate):
+- `ρ = 0.60` — AR(1) coefficient; moderate autocorrelation
+- `σ_ε = base × 0.04` — residual standard deviation (4% of baseline)
+
+This avoids the pharmacologically unrealistic pattern of i.i.d. residuals that would
+produce large high-frequency fluctuations inconsistent with the slow M-protein kinetics
+(turnover ~1–2 weeks).
+
+#### PLT Nadir Intra-Occasion Variability (IOV)
+
+Each patient's PLT nadir varies slightly from cycle to cycle beyond what the cumulative
+AUC term explains (due to day-to-day marrow variability, sampling timing, etc.). A
+log-normal IOV factor is applied per (patient, cycle) pair:
+
+```python
+_iov_factor = exp(η_occ − ½ · ω²_IOV)    # η_occ ~ N(0, ω²_IOV)
+dip = dip_amp_i × |PLT| × sin(π · day/28) × _iov_factor
+```
+
+Parameters:
+- `ω_IOV = 0.03` (CV ≈ 3%, log-normal)
+- Mean-corrected (the `−½ω²` term ensures E[factor] = 1.0) so Grade-3 PLT rates are
+  not shifted by the IOV
+
+IOV draws use an isolated per-subject RNG (`_resp_rng`, seeded from USUBJID hash) so
+they cannot propagate into the global RNG stream and drift other calibrated quantities.
+
+#### Ka Intra-Occasion Variability — Ixazomib PK
+
+The absorption rate Ka varies between dosing occasions (dense PK sampling cycles only).
+This reflects patient-level differences in GI motility, food effects, and gastric pH
+across cycles:
+
+```
+Ka_occ = Ka_i × exp(η_occ_Ka),    η_occ_Ka ~ N(0, ω²_IOV_Ka)
+```
+
+Applied only to timepoints < 24h post-dose in Cycles 1 and 3 (dense sampling cycles),
+with a linear taper: `scale = exp(η_occ_Ka × (1 − t/24))`. This confines the IOV
+effect to the absorption phase while leaving the terminal elimination phase unchanged.
+
+Parameters:
+- `ω_IOV_Ka = 0.25` (CV ≈ 25%)
+
+---
+
+### 2.1c pk_series Pipeline: Per-Patient Per-Cycle PK Metrics
+
+The `pk_series` pipeline connects the Ixazomib PK generator to the PD trajectory
+simulator at the individual level. For each IRd patient, a per-cycle dict is computed
+from their individual clearance (`IXAZ_CL_I = CL_pop × exp(η_CL_i)`) and actual doses
+from `sdtm_ex.csv`:
+
+```python
+AUC_weekly_i  = F × dose_mg_c × 1000 / CL_i      # ng·h/mL, that cycle's weekly dose
+AUC_cycle_i   = 3 × AUC_weekly_i                  # 3 doses per 28-day cycle
+AUC_cum_i     = Σ(AUC_cycle) up to cycle c        # cumulative from Cycle 1
+Cp_avg_i      = AUC_weekly_i / 168                # average plasma conc over 168h
+Cmax_approx_i = 41 × (CL_pop / CL_i) × (dose/4)  # proportional Cmax estimate
+```
+
+The cumulative AUC (`AUC_cum_i`) is then passed into `_sim_trajectory()` as the
+`pk_series` argument to drive the mechanistic PLT depression term:
+
+```python
+cum_factor = max(0.60, 1.0 − _SR_K_CUM_PLT × AUC_cum_c)
+# _SR_K_CUM_PLT = 1.337e-5 /(ng·h/mL) — calibrated so Grade-3 PLT targets are met
+```
+
+This means a patient who received full 4 mg doses for 6 cycles has a deeper PLT nadir
+in Cycle 6 than in Cycle 1 — even with the same weekly dose — consistent with the
+Srimani 2022 finding of progressive thrombocytopenia with cumulative exposure.
+
+For Rd arm patients (no ixazomib), a fallback linear drift is used instead of `pk_series`.
+
+---
+
 ### 2.2 AUC → M-protein: Two-Population Indirect Response (Srimani 2022)
 
 The published model separates drug-sensitive and drug-resistant myeloma cell populations:
@@ -344,6 +434,10 @@ Fitted using `lifelines.CoxPHFitter`; fallback to Mantel-Haenszel estimator.
 | A5 | HGB/PLT baseline from MVN output | `make_dm()` → passed to `_sim_trajectory()` |
 | A6 | M-protein Cycle 6 → PFS (Gaussian copula) | `make_ds()`, `_COPULA_RHO = -0.80` |
 | A7 | 20 cross-correlation validation criteria | `check_cross_correlations()` in `validate_data.py` |
+| A8 | AR(1) M-protein cycle residuals (ρ=0.60) | `_sim_trajectory()` in `generate_v2.py` |
+| A9 | PLT nadir IOV (ω=0.03, mean-corrected) | `make_lb()` per-cycle dip section |
+| A10 | Ka IOV (ω=0.25, absorption phase only) | `make_pc()` in `generate_pk_v2.py` |
+| A11 | `pk_series` pipeline: per-patient per-cycle AUC→PLT | `make_lb()` → `_sim_trajectory()` |
 
 The `IXAZ_CL_I` column in `adam_adsl.csv` is the per-patient individual Ixazomib clearance
 (L/h), shared between the main generator and PK generator to ensure PK exposures and PD

@@ -92,8 +92,14 @@ Takeda-data/
 ├── outputs/
 │   ├── tables/
 │   │   └── validation_summary.csv   Machine-readable 68-row pass/fail table
-│   └── validation/               Validation figures (KM, M-protein, PLT, PK VPC,
-│                                 covariate distributions, cross-correlation scatters)
+│   ├── figures/
+│   │   ├── MM2/                  705 per-patient PK+PD longitudinal figures
+│   │   ├── MM1/                  722 per-patient PK+PD longitudinal figures
+│   │   ├── pk_vpc_MM2.png        Ixazomib / Lenalidomide / Dexamethasone VPC
+│   │   ├── pk_vpc_MM1.png
+│   │   ├── pk_gof_MM2.png        6-panel GOF (Cmax, AUC, t½, covariate scatter, CWRES)
+│   │   └── pk_gof_MM1.png
+│   └── VALIDATION_REPORT.md      Comprehensive 68-criterion validation narrative
 │
 ├── .claude/skills/               Reusable pharmacometric knowledge
 │   ├── Cross_Correlations_Synthetic_Data_Guide.md
@@ -122,6 +128,9 @@ python3 scripts/generate_pk_v2.py
 
 # 3. Validate (should reach 68/68 PASS)
 python3 scripts/validate_data.py
+
+# 4. Generate per-patient figures (~1,427 PNGs, ~5 min)
+python3 scripts/plot_individual_patients.py
 ```
 
 Seeds are fixed (`MM2=42, MM1=43, SURV_RNG=77`) — all outputs are fully reproducible.
