@@ -1,6 +1,8 @@
-# Skills — TOURMALINE Project
+# Skills, Agents, and Trials — Multi-Agent Synthetic Clinical Trial Framework
 
-Reusable procedural knowledge for the TOURMALINE MM1/MM2 synthetic data project.
+Reusable procedural knowledge and agent definitions for the 11-trial synthetic
+oncology data generation framework. MM1/MM2 (Takeda/Ixazomib) are the validated
+seed pair. Nine additional Phase 3 trials cover distinct drug mechanisms.
 
 ## Loading Levels
 
@@ -17,17 +19,36 @@ the matching skill(s). Pull Level 3 code only when writing or modifying actual c
 
 ---
 
-## Skill Index
+## Agent Definitions (`.claude/agents/`)
+
+| Agent | Role | File |
+|-------|------|------|
+| Orchestrator | Sequences agents, enforces end condition, routes failures | [agents/orchestrator.md](../agents/orchestrator.md) |
+| QSP Scientist | PK/PD model selection, ODE parameterization, recalibration | [agents/qsp_scientist.md](../agents/qsp_scientist.md) |
+| Oncologist | Patient population, disease biology, clinical plausibility | [agents/oncologist.md](../agents/oncologist.md) |
+| Drug Developer | Trial design, dosing schedule, dose modifications, CDISC encoding | [agents/drug_developer.md](../agents/drug_developer.md) |
+| Literature Search | Published PK parameters, trial stats, evidence package | [agents/literature_search.md](../agents/literature_search.md) |
+
+## Trial Registry (`.claude/trials/`)
+
+| File | Contents |
+|------|---------|
+| [trials/registry.md](../trials/registry.md) | All 11 trials: branch, status, mechanism, N, published sources |
+
+## Skills Index
 
 | Skill | Applies when | load_cost |
 |-------|-------------|-----------|
-| [tourmaline-data-generation-workflow.md](tourmaline-data-generation-workflow.md) | Adding domains, re-running generation, looking up CDISC conventions or output paths | low |
-| [synthetic-clinical-trial-response-calibration.md](synthetic-clinical-trial-response-calibration.md) | ORR/VGPR/CR rates off target, CR appearing as VGPR, best-response waterfall issues | medium |
-| [plt-grade3-myelosuppression-calibration.md](plt-grade3-myelosuppression-calibration.md) | Grade 3 PLT off target, dip_amp doesn't scale as expected after code change | medium |
-| [pk-validation-cmax-vpc.md](pk-validation-cmax-vpc.md) | PK metrics failing, Cmax computation wrong, VPC construction | medium |
-| [synthetic-data-rng-management.md](synthetic-data-rng-management.md) | Rate changed after unrelated edit, MM1 shifted after MM2 change, probability changes non-proportional | low |
-| [Cross_Correlations_Synthetic_Data_Guide.md](Cross_Correlations_Synthetic_Data_Guide.md) | Implementing MVN baseline correlations, OMEGA Cholesky for PK etas, PK→PD Emax/linear equations, IXAZ_CL_I patient-level link | medium |
-| [Published_Mechanistic_Correlations_TOURMALINE.md](Published_Mechanistic_Correlations_TOURMALINE.md) | AUC→PLT linear model (Srimani 2022), M-protein two-population model, flat E-R for efficacy, Week 8 M-protein → HR 0.26 | medium |
+| [pd_modeling_guide.md](pd_modeling_guide.md) | Selecting/implementing a PD ODE class; wiring PK→PD dependencies | medium |
+| [trial_config_schema.md](trial_config_schema.md) | Writing or validating a trial config.yaml | medium |
+| [validation_framework.md](validation_framework.md) | Defining validation criteria, tolerances, agent sign-off checklists | medium |
+| [tourmaline-data-generation-workflow.md](tourmaline-data-generation-workflow.md) | Adding domains, re-running generation, CDISC conventions | low |
+| [synthetic-clinical-trial-response-calibration.md](synthetic-clinical-trial-response-calibration.md) | ORR/VGPR/CR rates off target | medium |
+| [plt-grade3-myelosuppression-calibration.md](plt-grade3-myelosuppression-calibration.md) | Grade 3 PLT off target, dip_amp calibration | medium |
+| [pk-validation-cmax-vpc.md](pk-validation-cmax-vpc.md) | PK metrics failing, Cmax wrong, VPC construction | medium |
+| [synthetic-data-rng-management.md](synthetic-data-rng-management.md) | Rate drifted after unrelated edit, RNG isolation | low |
+| [Cross_Correlations_Synthetic_Data_Guide.md](Cross_Correlations_Synthetic_Data_Guide.md) | MVN baseline correlations, OMEGA Cholesky, IXAZ_CL_I | medium |
+| [Published_Mechanistic_Correlations_TOURMALINE.md](Published_Mechanistic_Correlations_TOURMALINE.md) | Srimani 2022 AUC→PLT, M-protein two-population ODE, flat E-R | medium |
 
 ---
 
@@ -52,9 +73,11 @@ the matching skill(s). Pull Level 3 code only when writing or modifying actual c
 
 ---
 
-## Current Project State (2026-04)
+## Current Project State (2026-06-08)
 
-- **Validation**: 48/48 PASS (target: 68/68 after cross-correlation implementation)
-- **Seeds**: MM2=42, MM1=43, SURV_RNG=77
+- **Validation**: 68/68 PASS (MM1 and MM2, branch `MM1-MM2`)
+- **Seeds**: MM2=42, MM1=43, SURV_RNG=77 — frozen, never change
 - **Generator**: `scripts/generate_v2.py` (all domains), `scripts/generate_pk_v2.py` (PK)
-- **Next phase**: Cross-correlation implementation (Tracks A1–A7) → 68/68 PASS
+- **Next phase**: Option A — generalize engine into `engine/` library; write trial configs
+- **Pending trials**: POLLUX, CLL14, RESONATE, MONARCH-2, EMILIA, FLAURA, SOLO-1, KEYNOTE-189, RATIFY
+- **Architecture docs**: `MECHANISTIC_MODEL_AND_CROSS_CORRELATIONS.md`, `DOSE_PK_PD_CAUSAL_CHAIN.md`
